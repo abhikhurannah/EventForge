@@ -1,8 +1,6 @@
 # EventForge
 
-A multi-tenant event-processing and job-queue platform for developers. Projects send events over an authenticated HTTP API; events become background jobs that run through a priority-ordered Redis queue with automatic retries, a dead-letter queue for permanent failures, webhook delivery, and an operations dashboard. An optional AI assistant (Gemini) can summarize a failed job's sanitized logs and suggest next debugging steps — clearly labeled as a **suggestion, not a root cause**.
-
-> **Project status:** this is an early-stage build. The core event → queue → worker → job-record pipeline, idempotency, retries, and the dead-letter path work end-to-end. Authentication, the dashboard's live data wiring, webhook management, and the test suite are still minimal or stubbed — see [Current status & known gaps](#current-status--known-gaps) before you rely on this for anything real.
+EventForge is a multi-tenant event-processing and job-queue API with priority queues, idempotency, retries, dead-letter handling, webhook delivery, and AI-assisted failure explanations for developers.
 
 ---
 
