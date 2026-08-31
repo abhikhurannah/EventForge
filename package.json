@@ -1,0 +1,14 @@
+{
+  "name": "eventforge",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "dev": "concurrently \"npm run dev -w @eventforge/web\" \"npm run dev -w @eventforge/api\" \"npm run dev -w @eventforge/worker\"",
+    "build": "npm run build --workspaces",
+    "lint": "eslint . --ext ts,tsx --max-warnings 0",
+    "test": "npm run test --workspaces",
+    "seed": "npm run seed -w @eventforge/api"
+  },
+  "devDependencies": { "@eslint/js": "^9.16.0", "@types/node": "^22.10.2", "concurrently": "^9.1.0", "eslint": "^9.16.0", "typescript": "^5.7.2", "typescript-eslint": "^8.18.0" }
+}

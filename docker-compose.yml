@@ -1,0 +1,37 @@
+services:
+  mongodb:
+    image: mongo:7
+    ports: ["27017:27017"]
+    volumes: [mongo_data:/data/db]
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    command: redis-server --appendonly yes
+    volumes: [redis_data:/data]
+  api:
+    image: node:22-alpine
+    working_dir: /app
+    # Fix: all three services previously shared one bind-mounted node_modules and each ran
+    # `npm install` on its own container start. Three concurrent installs writing into the
+    # same directory race each other and reliably corrupt node_modules. Each service now gets
+    # its own anonymous volume for node_modules, layered on top of the shared source mount.
+    volumes: [.:/app, /app/node_modules]
+    command: sh -c "npm install && npm run dev -w @eventforge/api"
+    environment: [MONGODB_URI=mongodb://mongodb:27017/eventforge, REDIS_URL=redis://redis:6379, JWT_SECRET=local-development-secret, GEMINI_API_KEY=${GEMINI_API_KEY:-}, GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}]
+    ports: ["3001:3001"]
+    depends_on: [mongodb, redis]
+  worker:
+    image: node:22-alpine
+    working_dir: /app
+    volumes: [.:/app, /app/node_modules]
+    command: sh -c "npm install && npm run dev -w @eventforge/worker"
+    environment: [MONGODB_URI=mongodb://mongodb:27017/eventforge, REDIS_URL=redis://redis:6379]
+    depends_on: [mongodb, redis]
+  web:
+    image: node:22-alpine
+    working_dir: /app
+    volumes: [.:/app, /app/node_modules]
+    command: sh -c "npm install && npm run dev -w @eventforge/web -- --host 0.0.0.0"
+    ports: ["5173:5173"]
+    depends_on: [api]
+volumes: { mongo_data: {}, redis_data: {} }
