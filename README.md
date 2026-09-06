@@ -1,117 +1,570 @@
 # EventForge
 
-A React/TypeScript dashboard, Fastify API, MongoDB durable event store, and Redis/BullMQ worker for project-isolated event processing.
+### Project-isolated event processing, asynchronous jobs, and delivery visibility.
 
-## Start locally
+EventForge is a developer platform for accepting events through an API, processing them asynchronously, and understanding what happens afterward. It combines a React dashboard with a Fastify API, MongoDB-backed event records, Redis/BullMQ queues, and independently retried webhook deliveries.
 
-With Docker Desktop running, from this directory:
+The focus is backend engineering: tenant boundaries, idempotent ingestion, durable dispatch, retry semantics, and observable job states. Optional AI suggestions help interpret sanitized failure metadata; they are not the processing engine or a substitute for diagnosis.
+
+[Architecture](#architecture) · [Screenshots](#screenshots) · [Metrics](#metrics-and-observed-results) · [Local setup](#run-locally) · [Deployment](#deployment) · [Testing](#testing-and-ci)
+
+## What it solves
+
+Moving work outside an HTTP request introduces new questions: Was the event accepted? Did a client retry create a duplicate? Is the job waiting, running, or permanently failed? Did the downstream webhook succeed?
+
+EventForge provides a shared workflow for answering those questions:
+
+- **Decouple intake from execution.** Persist accepted events before processing them asynchronously.
+- **Make client retries safe.** Project-scoped idempotency keys distinguish duplicate requests from conflicting payloads.
+- **Recover from transient processing failures.** Retry with exponential backoff, then preserve exhausted jobs for inspection.
+- **Separate delivery failures from processing failures.** A failing webhook does not rerun successful event processing.
+- **Isolate project operations.** Scope API keys, jobs, metrics, and retry actions to an authenticated project owner.
+- **Replace opaque background work with visible state.** Inspect attempts, durations, sanitized errors, and delivery history.
+
+Example extension points include order notifications, application lifecycle events, integration tasks, and asynchronous workflows. The included processor is a **reference handler**: it accepts events and supports controlled failure simulation. It does not yet implement business-specific order, email, or payment processing.
+
+## Core capabilities
+
+| Area | Implemented behavior |
+|---|---|
+| Accounts | Registration, login, short-lived access JWTs, rotating refresh tokens, logout |
+| Projects | Owner-scoped workspaces and project switching |
+| API keys | Project-scoped keys, one-time secret display, hashed storage, revocation |
+| Ingestion | Validated JSON through `POST /events` and `POST /api/events` |
+| Idempotency | Compound unique index and canonical content digest |
+| Queues | Redis-backed BullMQ queues with priorities from 1 to 10 |
+| Recovery | Three processing attempts, exponential backoff, dead-letter archival, manual retry |
+| Rate limits | Shared per-project event budget across its API keys; additional request limits |
+| Dashboard | Status filtering, pagination, job inspection, 24-hour metrics, 10-second polling |
+| Webhooks | Signed HTTPS delivery, independent retries, per-attempt delivery logs |
+| AI assistance | Optional Gemini suggestions from allowlisted failure metadata |
+| Tooling | Docker Compose, TypeScript checks, Vitest, GitHub Actions, Vercel proxy configuration |
+
+Multi-tenancy is implemented as **owner-based project isolation**, not organization membership or team RBAC. There is no separate configurable quota for each individual key; keys belonging to a project share its ingestion budget.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Browser["React dashboard<br/>Vercel"] --> Proxy["Same-origin /api rewrite"]
+    Proxy --> API["Fastify API"]
+    Client["Developer application"] -->|API key + event| API
+    API -->|Accounts, keys, accepted events| Mongo[("MongoDB / Atlas")]
+    API -->|Rate limiting| Redis[("Redis / Valkey")]
+    Dispatcher["Worker dispatcher"] -->|Read pending records| Mongo
+    Dispatcher -->|Stable job IDs| Queue["BullMQ queues"]
+    Queue --- Redis
+    Queue --> Worker["Event processor"]
+    Worker -->|State, attempts, timings| Mongo
+    Worker -->|Exhausted job record| DLQ["Dead-letter archival"]
+    DLQ --> Queue
+    Mongo -->|Pending webhook delivery| Dispatcher
+    Queue --> Delivery["Webhook processor"]
+    Delivery -->|Signed HTTPS POST| Receiver["External receiver"]
+    Delivery -->|Delivery status and logs| Mongo
+    API -.->|Sanitized metadata, on request| Gemini["Optional Gemini API"]
+```
+
+### Component responsibilities
+
+- **Frontend:** React + TypeScript + Tailwind, built with Vite. Calls the API through `/api`, keeps the access token in memory, and refreshes dashboard data every 10 seconds.
+- **API:** Fastify validates requests, authenticates users and keys, enforces project ownership, stores events, and serves inspection and metrics endpoints.
+- **MongoDB:** Stores users, sessions, projects, keys, event state, timing fields, and webhook delivery records. Event documents also act as durable pending-dispatch records.
+- **Redis/BullMQ:** Provides queue coordination, priorities, backoff scheduling, and distributed rate-limit counters.
+- **Worker:** Polls pending records, dispatches queue jobs, consumes event and webhook queues, and updates durable state.
+- **AI provider:** Receives a small structured failure summary only when a user explicitly requests an explanation.
+
+### Data model
+
+| Collection | Responsibility |
+|---|---|
+| Users | Unique email and salted password hash |
+| Sessions | Hashed refresh token, user reference, expiry with TTL index |
+| Projects | Owner, project name, webhook configuration |
+| API keys | Project reference, key hash, display prefix, revocation timestamp |
+| Events | Payload, priority, idempotency digest, status, attempts, generation, dispatch flags, timings |
+| Deliveries | Event/generation reference, delivery body, status, attempt logs, signing secret |
+
+Important indexes include unique project/idempotency-key pairs for string keys, unique event/generation delivery pairs, and project/creation-time indexes for event retrieval.
+
+## How an event moves through the system
+
+1. A developer creates an account, a project, and an API key.
+2. A client sends an event with `x-api-key` and, optionally, `idempotency-key`.
+3. The API authenticates the key, applies the project rate limit, validates the body, and computes a canonical content digest.
+4. MongoDB persists the event with a queued state. The API returns `202 Accepted`; this means **stored**, not **processed**.
+5. The worker dispatcher finds pending events and enqueues them with a stable ID containing the event ID and retry generation.
+6. A BullMQ worker records the running state and executes the reference processor.
+7. Success records completion time, processing duration, and intake-to-completion latency. Failure schedules a retry or transitions to dead-letter state.
+8. If a webhook was configured when the event was accepted, successful processing creates a durable delivery handoff. Delivery retries independently.
+9. The dashboard retrieves current records and aggregates to display the outcome.
+
+```text
+queued → running → succeeded → optional webhook delivery
+             │
+             └→ retrying → running
+                              │
+                              └→ dead-letter → manual retry → queued
+```
+
+### Idempotency contract
+
+| Request | Response |
+|---|---|
+| New idempotency key in a project | `202`, new event/job ID |
+| Same key and normalized content in the same project | `200`, existing event/job ID, `duplicate: true` |
+| Same key with different content | `409 Conflict` |
+| No idempotency key | Independent event for every accepted request |
+
+The digest includes the normalized event name, payload, and priority. Object key ordering is canonicalized. The database unique index protects concurrent duplicate requests; idempotency does not depend on an in-memory check.
+
+### Reliability semantics
+
+- **At-least-once, not exactly-once:** crashes around side effects or acknowledgments can cause repeated execution or delivery. Domain handlers and webhook receivers must be idempotent.
+- **Durable handoff:** undispatched events remain in MongoDB if queue dispatch fails. Stable BullMQ IDs protect repeated enqueue attempts within an event generation.
+- **Intake still depends on Redis:** rate limiting runs before the MongoDB insert, so a Redis outage can also delay or prevent new ingestion. Durable dispatch protects already-accepted work; it does not make the API Redis-independent.
+- **Priorities:** 10 is the highest application priority; the worker maps it to BullMQ's positive-priority ordering. Priority does not preempt a job already running.
+- **Automatic retries:** three total attempts, with default backoff delays of 1 second and 2 seconds. These are scheduling delays, not completion-time guarantees.
+- **Dead-letter recovery:** permanently failed events are archived to a separate queue. Manual retry requires completed archival and increments a generation under the original event ID.
+- **Independent webhook retries:** failed delivery does not change a successful event into a processing failure.
+- **Shutdown:** signal handlers stop dispatching and close workers, queues, and database connections.
+- **Known recovery boundary:** Redis data loss after dispatch is not fully rebuilt automatically from MongoDB. Queue restoration/reconciliation requires operational work.
+
+## Technology stack
+
+| Layer | Technologies |
+|---|---|
+| Frontend | React 18, TypeScript, Tailwind CSS 3, Vite 6 |
+| Backend | Node.js 22, Fastify 5, Zod |
+| Persistence | MongoDB 7 locally, MongoDB Atlas for hosted storage, Mongoose 8 |
+| Queue/cache | Redis 7 locally, Render Valkey-compatible Key Value, BullMQ 5, ioredis |
+| Authentication | Fastify JWT, Node.js crypto/scrypt, HTTP-only refresh cookies |
+| Testing | Vitest 5, Fastify `app.inject()`, real MongoDB/Redis integration fixtures |
+| Local infrastructure | Docker, Docker Compose |
+| CI | GitHub Actions |
+| Hosting | Vercel frontend, Render backend processes, MongoDB Atlas, Render Key Value |
+| Optional AI | Gemini REST API |
+
+Dependency ranges live in [package.json](package.json); exact resolved versions live in [package-lock.json](package-lock.json). Commit both files together when changing dependencies.
+
+## Screenshots
+
+The six captures below document the application on **7 September 2026**. They show a small demonstration dataset, not seeded benchmark results.
+
+### Overview dashboard
+
+Project-scoped counters, processing duration, latency, failure rate, and retry rate.
+
+![EventForge overview with one accepted and successful event](public/Screenshot%202026-09-07%20at%2012.01.40%E2%80%AFAM.png)
+
+### Intake and processing states
+
+Hourly intake, state distribution, and the recent-jobs table for the demonstrated project.
+
+![Hourly event intake, processing states, and recent jobs](public/Screenshot%202026-09-07%20at%2012.02.41%E2%80%AFAM.png)
+
+### Job management
+
+Filterable job history with attempt count, recorded processing time, and inspection actions.
+
+![Job list showing a succeeded order.created event](public/Screenshot%202026-09-07%20at%2012.02.56%E2%80%AFAM.png)
+
+### API key management
+
+Project keys expose only a display prefix after creation and can be revoked for subsequent requests.
+
+![Project API key list with active status and revoke action](public/Screenshot%202026-09-07%20at%2012.03.04%E2%80%AFAM.png)
+
+### Webhook configuration
+
+Configure a public HTTPS destination and inspect delivery history. This capture has no recorded deliveries and does not demonstrate successful external delivery.
+
+![Webhook configuration form and empty delivery history](public/Screenshot%202026-09-07%20at%2012.03.12%E2%80%AFAM.png)
+
+### Event submission
+
+Send JSON with a project API key, event name, priority, and optional idempotency key.
+
+![Send event dialog with JSON payload, priority, and idempotency fields](public/Screenshot%202026-09-07%20at%2012.03.33%E2%80%AFAM.png)
+
+## Metrics and observed results
+
+Metrics are computed from MongoDB events **received in the preceding 24 hours**, scoped to the selected project. Job listings are separate and cover all time.
+
+| Metric | Definition |
+|---|---|
+| Events received | Count of persisted events in the window |
+| Succeeded | Events in that cohort currently marked succeeded |
+| Average processing | Mean recorded duration of the successful attempt for succeeded events |
+| Average latency | Mean time from original intake to successful completion, including queue wait and retries |
+| Failure rate | Current dead-letter events ÷ received events × 100 |
+| Retry rate | Events with more than one cumulative processing attempt ÷ received events × 100 |
+| Event intake | Accepted event counts grouped into UTC hourly buckets |
+| Processing states | Queued, running, retrying, succeeded, and dead-letter counts |
+
+These are current-state aggregates, not an immutable history of failures. A manual retry can change an event's state; latency still starts at original intake. Missing rates or successful timings display as `—`, while empty counts display zero. Processing duration is an application-level timer, not an isolated CPU benchmark.
+
+### Recorded demo sample
+
+Source: the overview and job screenshots above, captured on 7 September 2026.
+
+| Observation | Displayed value |
+|---|---|
+| Events received | 1 |
+| Succeeded | 1 |
+| Processing attempts | 1 |
+| Average processing | 292 ms |
+| Average intake-to-success latency | 2,772 ms |
+| Permanent failure rate | 0.00% |
+| Retry rate | 0.00% |
+| Queued / running / retrying / dead-letter | 0 / 0 / 0 / 0 |
+
+**Sample size: one event.** This confirms the displayed intake-to-success workflow for that sample; it does not establish throughput, reliability under load, p95/p99 latency, uptime, or an SLA. No load-test benchmark is claimed.
+
+## Run locally
+
+### Prerequisites
+
+- Git.
+- Docker Desktop or Docker Engine with Compose.
+- Node.js 22.12+ within the Node 22 release line and npm when running application processes outside Docker.
+- Ports 5173, 3001, 27017, and 6379 available locally.
+
+### Option A: full Docker Compose stack
 
 ```sh
+git clone https://github.com/abhikhurannah/EventForge.git
+cd EventForge
 docker compose up --build
 ```
 
-Open **http://localhost:5173**, create an account (password: 12+ characters), create a project, and create an API key. The secret is shown once. Use **Send event** or the curl example below. The dashboard polls every 10 seconds.
+Open **http://localhost:5173**. The API runs at **http://localhost:3001**.
 
-Local database connection strings, for tools running on your Mac:
+Compose starts the frontend development server, API, worker, MongoDB, and Redis. Redis uses AOF and `noeviction`; local database ports are bound to loopback. Named volumes survive `docker compose down`. Adding `-v` removes those volumes and their data.
+
+### Option B: application processes on your machine
+
+```sh
+docker compose up -d mongo redis
+npm ci
+```
+
+Create a local, gitignored `.env` with development-only values:
 
 ```dotenv
 MONGODB_URI=mongodb://127.0.0.1:27017/eventforge
 REDIS_URL=redis://127.0.0.1:6379
+JWT_SECRET=local-only-change-this-to-at-least-32-random-characters
+WEB_ORIGIN=http://localhost:5173
+PORT=3001
+NODE_ENV=development
+PROJECT_RATE_LIMIT=100
+RETRY_DELAY_MS=1000
+WORKER_CONCURRENCY=5
 ```
 
-Inside Docker Compose, the service hostnames are `mongo` and `redis`; the compose file already sets those URLs. No Atlas/Redis-provider account is needed locally. Local ports are bound to loopback; volumes persist across `docker compose down`. Do not add `-v` unless intentionally deleting local database data.
-
-For development without containerizing the application:
+Then run:
 
 ```sh
-docker compose up -d mongo redis
-cp .env.example .env
-npm install
 npm run dev
 ```
 
-Use Node 22.12 or newer. API and worker scripts load `.env` if it exists. Vite proxies `/api` to the local API. The API also accepts the requested `POST /events` path directly on port 3001.
+The development command starts the API, worker, and Vite concurrently. Vite proxies `/api` to the local API. API and worker startup scripts load `.env` if present.
 
-## First event
+### First event
+
+Create an account with a 12–128 character password, create a project, then create an API key. Copy the secret when it is shown; it is not retrievable later.
 
 ```sh
 curl http://localhost:3001/events \
-  -H 'content-type: application/json' \
+  -H 'Content-Type: application/json' \
   -H 'x-api-key: YOUR_PROJECT_API_KEY' \
   -H 'idempotency-key: order-123' \
   -d '{"name":"order.created","payload":{"orderId":"123"},"priority":8}'
 ```
 
-An accepted event returns `202` with a stable event/job ID. Same project, same idempotency key and same normalized content returns `200` with that ID. Changed content returns `409`. Keys are optional; requests without one create independent events. Concurrent duplicate requests are protected by a MongoDB partial unique index.
+Expected new-event response shape:
 
-The reference processor accepts validated events; add domain-specific handlers in `server/processing.ts`. To demonstrate retries, send `{"failUntilAttempt":1}` as the payload: attempt two succeeds. `{"simulateFailure":true}` exhausts all three attempts. Retrying a permanently failing payload will fail again; manual retry is intended for failures whose underlying cause has been fixed.
-
-## Reliability model
-
-- The event document is also the durable dispatch record. API acceptance requires a successful MongoDB insert. A worker dispatcher enqueues pending records; Redis outages leave them available for later dispatch.
-- Stable BullMQ IDs prevent duplicate dispatch. Queue entries are retained; removal/retention must preserve idempotency records before being introduced.
-- Priority 10 is highest; all priorities map to BullMQ's positive-priority range.
-- Jobs receive three processing attempts with exponential backoff (1s then 2s by default). Exponential delay is configurable with `RETRY_DELAY_MS` for tests.
-- Exhausted records are marked `dead-letter`, then archived into a separate BullMQ queue. A durable pending flag retries archival after a crash.
-- Manual retries require ownership and terminal state. They create a new generation under the same event ID. Historical dead-letter queue entries remain available.
-- Successful event processing and webhook delivery are separate. A failed webhook does not rerun the event processor. A durable delivery flag closes the handoff gap.
-- Webhook requests are signed, time-bounded and retried three times. Delivery history records attempt, HTTP status and a sanitized error code. Response bodies are deliberately not stored.
-- Public IPv4 HTTPS destinations on port 443 only. DNS results are checked and the chosen address pinned for the TLS request; redirects are not followed.
-- At-least-once processing/delivery: consumer side effects must be idempotent. The receiver should deduplicate `x-eventforge-id`, verify HMAC-SHA256 over `timestamp + "." + rawBody`, and reject stale timestamps. A crash after delivery but before acknowledgment may deliver twice.
-- Redis uses AOF and `noeviction` locally. Loss of Redis data after dispatch still requires operational recovery; this is not an exactly-once system. No retention automation or multi-region failover is claimed.
-
-## Authentication and tenant boundaries
-
-Passwords use salted scrypt. Access JWTs expire after 15 minutes and remain in browser memory. Refresh tokens are random, hashed in MongoDB, rotated atomically on use, and transported in an HTTP-only, SameSite=Strict cookie. Production adds Secure. Refresh/logout require the configured Origin. API keys are hashed, shown once and revocable. Project ownership is checked for reads, retry actions, keys, metrics and AI suggestions.
-
-Use a long random `JWT_SECRET` for production. The compose default is only for local development. All API paths other than auth, health and ingest require a user access token. Ingest requires an active project API key. The project limit defaults to 100 events/minute and is shared across its keys through Redis.
-
-## Metrics
-
-The overview uses events received in the last 24 hours. Counts, hourly intake, retry counts, successful-attempt processing duration and permanent failure rate are computed from MongoDB records. Latency is elapsed time from intake through success, including queue wait and backoff; processing duration covers the successful processing attempt. Empty datasets display zero counts and undefined rates/durations as `—`. Job listings cover all time and support paging/status filtering.
-
-There are no seeded metrics or benchmark claims. The processor is a reference handler; production throughput depends on the domain handler, services and hardware.
-
-## Optional AI
-
-Set `GEMINI_API_KEY` and `GEMINI_MODEL` in the API's environment to enable the explicit failure explanation button. Choose a model enabled in your Google AI Studio account. Only allowlisted error codes, state and numeric attempt counts are sent. Raw logs, payloads, event names, URLs and identifiers are excluded. Output is labeled **Suggestion—not root cause**. AI is not required for processing.
-
-## Checks
-
-```sh
-npm run lint
-npm test
-npm run build
-docker compose up -d mongo redis
-npm run test:integration
+```json
+{
+  "eventId": "<generated-event-id>",
+  "jobId": "<same-generated-event-id>",
+  "status": "queued",
+  "duplicate": false
+}
 ```
 
-`lint` currently performs strict TypeScript checking. Unit tests cover request contracts, password hashing, sanitization, webhook destination checks and signatures. Integration tests require real MongoDB/Redis and cover auth/isolation, refresh replay, concurrent idempotency, unkeyed events, project rate limits, dispatch, retries, dead-letter behavior and key revocation. They use the database `eventforge_test` and a unique Redis queue prefix; they never flush a shared Redis instance.
+Repeat the exact request to check deduplication. Change its payload while retaining the same idempotency key to check conflict handling.
 
-CI runs unit and integration tests, type checking and the production web build. CI and Docker use `npm ci` with the included lockfile. The lockfile includes cached optional native-package manifests for other platforms; a clean online install should be verified on the deployment host.
+For the hosted frontend proxy, use `https://YOUR-FRONTEND/api/events`. For a direct backend integration, use `https://YOUR-BACKEND/events`.
+
+### Exercise failure behavior
+
+| Payload | Expected reference-handler behavior |
+|---|---|
+| `{"orderId":"123"}` | Succeeds normally |
+| `{"failUntilAttempt":1}` | Fails once, then succeeds on the second attempt |
+| `{"simulateFailure":true}` | Exhausts three attempts and enters dead-letter state |
+
+Use a new idempotency key for each distinct event. Inspect a terminal job and choose Retry after addressing its failure. A permanently failing simulation will fail again after manual retry.
+
+## API reference
+
+User-protected routes require `Authorization: Bearer <access-token>`. Ingestion requires `x-api-key`; the project is determined from the key, not a client-supplied project ID.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/health` | MongoDB/Redis connection readiness |
+| POST | `/api/auth/register` | Create account and session |
+| POST | `/api/auth/login` | Authenticate and create session |
+| POST | `/api/auth/refresh` | Rotate refresh cookie and issue access JWT |
+| POST | `/api/auth/logout` | Invalidate refresh session |
+| GET / POST | `/api/projects` | List owned projects / create project |
+| GET / POST | `/api/projects/:projectId/keys` | List / create project keys |
+| DELETE | `/api/projects/:projectId/keys/:keyId` | Revoke key |
+| POST | `/events` or `/api/events` | Accept event |
+| GET | `/api/projects/:projectId/jobs` | List jobs; optional `status` and `page` |
+| GET | `/api/projects/:projectId/jobs/:jobId` | Inspect one job |
+| POST | `/api/projects/:projectId/jobs/:jobId/retry` | Retry archived terminal job |
+| GET | `/api/projects/:projectId/metrics` | Retrieve 24-hour aggregates |
+| PUT | `/api/projects/:projectId/webhook` | Configure or disable webhook |
+| GET | `/api/projects/:projectId/deliveries` | Retrieve latest 100 delivery records |
+| POST | `/api/projects/:projectId/jobs/:jobId/explain` | Request optional AI suggestion |
+
+Job pages contain up to 25 records. Valid status filters are `queued`, `running`, `retrying`, `succeeded`, and `dead-letter`.
+
+Event names are 2–100 characters and match `^[a-z][a-z0-9_.-]+$`. Payloads are JSON objects; priority is an integer from 1 to 10, defaulting to 5. Unknown top-level event fields are rejected. Request bodies are limited to 64 KiB.
+
+Common responses include `401` for missing/invalid authentication, `403` for origin rejection, `404` for inaccessible resources, `409` for conflicts, `422` for validation failures, and `429` for rate limits.
+
+## Authentication and security
+
+- Passwords use salted scrypt and timing-safe comparison.
+- Access JWTs expire after 15 minutes and are held in browser memory.
+- Refresh tokens are random, hashed in MongoDB, expire after 30 days, and rotate atomically on use.
+- Refresh cookies use `HttpOnly`, `SameSite=Strict`, and `Path=/api/auth`; production adds `Secure`.
+- Mutating browser requests are checked against the exact configured origin. Refresh and logout require that origin.
+- Project ownership is checked before exposing jobs, keys, metrics, configuration, retries, or AI suggestions.
+- API key secrets are stored as hashes, shown once, and revocable.
+- The default ingestion budget is 100 requests per project per 60-second counter window, shared across its keys. Duplicates and invalid event bodies also consume this budget after key authentication.
+- Additional request limits include a default 120 requests/minute, 10/minute for registration/login, and 5/minute for AI explanations. Behind proxies, request-IP behavior needs deployment-specific review.
+- Request logging redacts authorization, cookies, and API key headers. AI receives no raw payloads or free-form logs.
+
+Keep credentials in local ignored files or provider secret settings. Never publish them in screenshots, README examples, frontend variables, or committed templates. Rotate any exposed credentials; deleting a current file does not erase Git history. These controls are not a claim of a completed security audit.
+
+## Webhook delivery
+
+Each project can configure one HTTPS endpoint. The event captures its webhook configuration at ingestion, so changing the project endpoint affects newly accepted events.
+
+After successful processing, the delivery worker sends:
+
+- `x-eventforge-id`: stable delivery record ID.
+- `x-eventforge-timestamp`: Unix timestamp in seconds.
+- `x-eventforge-signature`: hex HMAC-SHA256 of `timestamp + "." + rawBody`.
+
+Receivers should verify the signature with the configured signing secret, reject stale timestamps, and deduplicate delivery IDs. The JSON body's `id` identifies the event; the header identifies the delivery.
+
+Delivery supports three attempts with exponential backoff and a 10-second HTTP request timeout after DNS resolution. Logs record attempt, timestamp, HTTP status when available, and sanitized error code—not response bodies.
+
+Destination validation permits public IPv4 HTTPS destinations on port 443, rejects embedded credentials and fragments, validates DNS answers, pins the checked address for the TLS request, and does not follow redirects. Localhost HTTP webhook receivers are intentionally unsupported.
+
+## Optional AI failure explanations
+
+Set `GEMINI_API_KEY` and `GEMINI_MODEL` on the API service to enable explanations. Choose a model available to your provider account.
+
+The request contains only an allowlisted error code, job state, attempt count, and maximum attempts. Payloads, event names, URLs, credentials, identifiers, and raw logs are excluded. The provider call has a 15-second timeout.
+
+Every response is labeled **“Suggestion—not root cause.”** Missing configuration or provider failure does not disable core event processing. An AI explanation is a debugging aid, not evidence that a root cause has been established.
+
+## Configuration
+
+| Variable | Used by | Purpose / default |
+|---|---|---|
+| `MONGODB_URI` | API + worker | Same MongoDB database; defaults to local `eventforge` |
+| `REDIS_URL` | API + worker | Same Redis instance; defaults to localhost:6379 |
+| `JWT_SECRET` | API | Required; at least 32 characters; use a random production secret |
+| `WEB_ORIGIN` | API | Exact frontend origin; default `http://localhost:5173` |
+| `PORT` | API | HTTP listener; default 3001; Render supplies its port |
+| `NODE_ENV` | Application | Set `production` for hosted secure cookies |
+| `PROJECT_RATE_LIMIT` | API | Shared project ingestion limit; default 100/minute |
+| `RETRY_DELAY_MS` | Worker | Initial exponential backoff delay; default 1000 |
+| `WORKER_CONCURRENCY` | Worker | Event concurrency; default 5; webhook concurrency is separately fixed at 5 |
+| `QUEUE_PREFIX` | API + worker | Queue/rate-limit namespace; default `eventforge`; must match |
+| `GEMINI_API_KEY` | API | Optional server-only provider secret |
+| `GEMINI_MODEL` | API | Optional provider model identifier |
+| `VITE_API_URL` | Frontend build | Leave unset for same-origin `/api` routing |
+| `API_PROXY_TARGET` | Vite dev server | Local proxy target; default local API, Compose uses `http://api:3001` |
+
+Generate a production signing secret locally with `openssl rand -hex 32`. Do not commit or paste its output publicly.
 
 ## Deployment
 
-Frontend: Vercel, build `npm run build`, output `dist`. API and worker: separate Render or Railway services from this repository; commands `npm run start:api` and `npm run start:worker`. Both require the same `MONGODB_URI` and `REDIS_URL`. Only the API needs `JWT_SECRET`, `WEB_ORIGIN`, and optional Gemini credentials.
+The documented hosted setup uses **Vercel for the frontend, Render for API/worker processes, MongoDB Atlas for persistence, and Render Key Value for BullMQ**. The screenshots show the deployed application's one-event workflow; they do not verify every feature or ongoing service availability.
 
-Provision MongoDB Atlas and a Redis provider; copy their connection strings into the hosting services' secret/environment settings. Use TLS URLs and provider network controls. Never commit real credentials. The local URLs above do not work for remote hosting.
+The repository's [vercel.json](vercel.json) currently proxies API traffic to `https://eventforge-pmko.onrender.com`. Forks must substitute their own backend.
 
-For browser authentication, route `/api/*` through the frontend origin to the API, or use same-site custom domains. Do not set VITE_API_URL to an unrelated Railway/Render domain and expect SameSite=Strict refresh cookies to work. `deploy/vercel.example.json` shows a same-origin proxy; replace its placeholder with the deployed backend origin and save it as `vercel.json` before deploying. Set `WEB_ORIGIN` to the exact frontend HTTPS origin. Keep VITE_API_URL empty for this configuration.
+### 1. Provision MongoDB and Redis-compatible storage
 
-No cloud services have been provisioned, no secrets are included, and no public deployment is claimed.
+Create an Atlas database user and configure network access for the backend. Store its connection string only on Render. URL-encode special characters in database passwords.
 
-## Source map
+Place Render Key Value in the same region as the backend and use its internal connection URL. Use provider-supported persistence and a no-eviction policy for reliable queue operation. Both API and worker must use the same database, Redis endpoint, and queue prefix.
 
-| File | Purpose |
+### 2. Run the backend
+
+The Dockerfile uses Node 22 Alpine, installs locked dependencies, type-checks/builds the frontend, and defaults to `npm run start:api`.
+
+For a **small free-tier demonstration**, run the real API and worker together in one Render Web Service using this Docker Command:
+
+```sh
+./node_modules/.bin/concurrently --kill-others "npm run start:api" "npm run start:worker"
+```
+
+Set backend environment variables from the table above, including `NODE_ENV=production`, a new `JWT_SECRET`, and the production `WEB_ORIGIN`. Set the health-check path to `/api/health`. Event concurrency can be reduced to 1 for a small demo.
+
+For an **always-on deployment topology**, run separate services:
+
+| Service | Startup command |
 |---|---|
-| `server/app.ts` | Authentication, projects, API keys, ingest, inspection, retry and metrics routes |
-| `server/db.ts` | MongoDB schemas and indexes |
-| `server/core.ts` | Validation, canonical request hashing, password hashing, safe error metadata |
-| `server/processing.ts` | Durable dispatch and processing/delivery handlers |
-| `server/worker.ts` | BullMQ consumers, polling and shutdown |
-| `server/webhooks.ts` | Destination validation, pinned HTTPS delivery and signing |
-| `web/main.tsx` | Live dashboard and account flows |
-| `web/api.ts` | In-memory access tokens and refresh retry |
-| `tests/` | Unit and opt-in integration suites |
+| API web service | `npm run start:api` |
+| Background worker | `npm run start:worker` |
 
-See `outputs/DEMO.md` for a four-minute recording script. A video has not been recorded yet.
+A worker-only process does not listen for HTTP requests and should not be configured as an HTTP Web Service.
+
+### 3. Configure Vercel
+
+Import the GitHub repository with:
+
+| Setting | Value |
+|---|---|
+| Framework | Vite |
+| Root directory | Repository root |
+| Install command | `npm ci` |
+| Build command | `npm run build` |
+| Output directory | `dist` |
+| Production branch | `main` |
+| Frontend environment variables | None required for the proxy setup |
+
+Configure the backend rewrite in the root `vercel.json`:
+
+```json
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://YOUR-BACKEND.onrender.com/api/:path*"
+    }
+  ]
+}
+```
+
+The [Vercel external rewrite](https://vercel.com/docs/routing/rewrites) keeps browser API calls on the frontend origin. Leave `VITE_API_URL` unset; pointing it directly at an unrelated backend domain conflicts with the current strict refresh-cookie design. Never expose database or signing secrets through `VITE_` variables.
+
+After obtaining the stable Vercel production domain, set Render's `WEB_ORIGIN` to that exact HTTPS origin, without a trailing slash, and redeploy Render. Preview domains are different origins and are not automatically authorized.
+
+Merge deployment changes into `main`. A successful feature-branch preview does not update production, and redeploying an old failed commit does not pick up later fixes.
+
+### 4. Verify the deployment
+
+1. Open the backend `/api/health`, then the same path through the frontend domain; expect `{"ok":true}`.
+2. Register, refresh the page, and verify session renewal.
+3. Create a project/key and submit an event; verify it reaches succeeded.
+4. Repeat an idempotent request and verify the same event ID.
+5. Submit controlled transient and permanent failures; verify retries and dead-letter behavior.
+6. Configure a receiver you control and check signed delivery/retry logs.
+7. Enable and separately test AI only if needed.
+
+The health endpoint checks connection state; it is not a worker heartbeat or proof of successful processing.
+
+### Free-tier limitations
+
+Render Free Web Services sleep after 15 minutes without incoming traffic. With the combined topology, the worker sleeps too, so unattended jobs and webhooks can be delayed. Free Key Value is in-memory only and loses data on restart. Usage quotas and billing limits also apply. See [Render's free-service documentation](https://render.com/docs/free).
+
+This configuration is a portfolio/demo deployment, not a production reliability guarantee. Always-on workers, persistent queues, backups, monitoring, and tested recovery procedures are prerequisites for stronger operational assurances.
+
+## Testing and CI
+
+```sh
+npm ci
+npm run lint
+npm test
+npm run build
+```
+
+The latest maintainer-provided local run during deployment reported **22 unit tests passed**, **9 integration tests skipped**, successful TypeScript checks, and a successful production build. This is not a claim that integration tests passed.
+
+Run the integration suite against disposable local services:
+
+```sh
+docker compose up -d mongo redis
+MONGODB_URI=mongodb://127.0.0.1:27017/eventforge_test REDIS_URL=redis://127.0.0.1:6379 npm run test:integration
+```
+
+| Suite | Coverage |
+|---|---|
+| Unit | Event validation, canonicalization, password hashing, safe errors, retry thresholds, webhook destination rules, HMAC signatures |
+| Integration | Authentication/isolation, refresh replay, concurrent idempotency, unkeyed requests, rate limits, dispatch, retries, dead-letter/manual retry, key revocation, webhook retry separation |
+
+Integration tests use Fastify injection, real MongoDB and BullMQ/Redis, and a stubbed outbound webhook sender. They require the `eventforge_test` database, isolate queue names with a test prefix, and clean test queues rather than flushing shared Redis. Use a dedicated test Redis instance, never production.
+
+[GitHub Actions](.github/workflows/ci.yml) is configured for pushes and pull requests: locked install → TypeScript check → unit tests → integration tests with MongoDB/Redis services → web build. The `lint` script is TypeScript checking, not a separate ESLint ruleset.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `Origin not allowed` | Render `WEB_ORIGIN` must exactly match the website being used; save and redeploy |
+| `npm ci` dependency mismatch | Regenerate the lock file for the intended dependency versions, test, and commit both dependency files |
+| Preview Ready, production failing | Merge the fixed feature branch into `main`; check the deployment commit |
+| `MongoServerError: bad auth` | Atlas database-user credentials, password encoding, database/auth settings, and saved Render URI |
+| No open HTTP ports | A worker-only command is running as a web service; use the combined command or a background worker |
+| Jobs remain queued | Worker startup, matching MongoDB/Redis/prefix, dispatch logs, free-service sleep, or queue data loss |
+| `.env not found. Continuing without it.` | Expected on Render when configuration comes from service environment settings |
+| Webhook rejected | Destination must resolve to public IPv4 and use HTTPS port 443 without redirects |
+| AI unavailable | Both Gemini settings are required; core processing does not depend on them |
+
+Do not disable origin validation or replace restricted settings with wildcards to work around authentication errors.
+
+## Repository guide
+
+```text
+EventForge/
+├── server/
+│   ├── app.ts             # HTTP routes, auth, ownership, ingestion, metrics, AI
+│   ├── core.ts            # Validation, hashing, safe errors, signatures
+│   ├── db.ts              # MongoDB models and indexes
+│   ├── redis.ts           # Connections, queue names, retry options
+│   ├── processing.ts      # Dispatcher and event/delivery processors
+│   ├── webhooks.ts        # Destination checks and signed HTTPS transport
+│   ├── worker.ts          # Consumers, polling, shutdown
+│   └── index.ts           # API bootstrap
+├── web/
+│   ├── main.tsx           # Dashboard and account UI
+│   └── api.ts             # Requests, access token, refresh handling
+├── public/                # Six product screenshots
+├── tests/                 # Unit and opt-in integration suites
+├── deploy/                # Example Vercel configuration
+├── outputs/               # Setup notes, verification notes, demo script
+├── .github/workflows/     # Continuous integration
+├── compose.yaml           # Local five-service stack
+├── Dockerfile             # Application container
+├── vercel.json            # Frontend build and API rewrite
+├── package.json
+└── package-lock.json
+```
+
+## Scope and next steps
+
+Implemented foundations are intentionally distinguished from future work:
+
+- Add domain-specific event handlers and side-effect idempotency.
+- Automate reconciliation after Redis data loss and define retention policies.
+- Add team membership/RBAC and optional per-key quotas.
+- Add worker heartbeats, alerting, tracing, and latency percentiles.
+- Run documented load tests before publishing capacity or reliability claims.
+- Test backup restoration and always-on infrastructure failure scenarios.
+- Record the 3–5 minute walkthrough using [the demo script](outputs/DEMO.md); no finished video is included.
+- Complete a security review and remove/rotate any historically exposed credentials.
+
+EventForge demonstrates a working event-processing foundation with explicit reliability boundaries—not an exactly-once system or a finished managed queue service.
