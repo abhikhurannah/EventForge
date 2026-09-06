@@ -19,7 +19,8 @@ export async function buildApp() {
   const app = Fastify({ bodyLimit: 65536, logger: { redact: ['req.headers.authorization', 'req.headers.cookie', 'req.headers.x-api-key'] } });
   await app.register(cors, { origin: origin(), credentials: true });
   await app.register(jwt, { secret });
-  await app.register(rateLimit, { redis, max: 120, timeWindow: '1 minute' });
+  const requestLimit = z.coerce.number().int().min(1).max(1_000_000).parse(process.env.REQUEST_RATE_LIMIT || 120);
+  await app.register(rateLimit, { redis, max: requestLimit, timeWindow: '1 minute' });
   app.setErrorHandler((err, _req, reply) => {
     if (err instanceof ZodError) return reply.code(422).send({ error: 'Invalid request', details: err.flatten() });
     if ((err as { code?: number }).code === 11000) return reply.code(409).send({ error: 'Resource already exists' });

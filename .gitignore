@@ -5,3 +5,4 @@ coverage/
 work/
 *.tsbuildinfo
 .DS_Store
+benchmarks/results/

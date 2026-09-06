@@ -219,7 +219,49 @@ Source: the overview and job screenshots above, captured on 7 September 2026.
 | Retry rate | 0.00% |
 | Queued / running / retrying / dead-letter | 0 / 0 / 0 / 0 |
 
-**Sample size: one event.** This confirms the displayed intake-to-success workflow for that sample; it does not establish throughput, reliability under load, p95/p99 latency, uptime, or an SLA. No load-test benchmark is claimed.
+**Sample size: one event.** This screenshot confirms only that sample's intake-to-success workflow. The separate local load test below provides repeated burst measurements; it does not measure hosted capacity, uptime, or an SLA.
+
+### Reproducible load testing
+
+An isolated [benchmark suite](benchmarks/README.md) now exercises real HTTP ingestion, MongoDB persistence, BullMQ processing, concurrent idempotency, retries, dead-letter archival, manual retry, project rate limits across keys, and account isolation. It creates its own disposable fixtures; no production seed data or credentials are required.
+
+The default workload is a 20-event warm-up followed by three rounds of 500 unique events at client concurrency 10. Reports include accepted requests/second, observed completions/second, HTTP and end-to-end p50/p95/p99 latency, processing duration, response-status counts, and correctness checks. Numeric raw samples and environment metadata are retained for review.
+
+### Verified local load-test results — 7 September 2026
+
+**1,500/1,500 measured events accepted and successfully processed**, across three 500-event bursts. All eight additional correctness probes passed. The 20-event warm-up and deliberately failing reliability fixtures are excluded from the throughput table.
+
+Evidence: [generated report](benchmarks/published/2026-09-07-local-m2/report.md) and [raw samples and configuration](benchmarks/published/2026-09-07-local-m2/report.json). The reported latency percentiles were independently recalculated from the raw samples and matched. The earlier blocked agent attempt is not included as a benchmark result.
+
+| Round | Accepted / succeeded | Intake (accepted req/s) | Observed completions/s | HTTP p95 | End-to-end p95 | End-to-end p99 | Processing p95 |
+|---|---|---|---|---|---|---|---|
+| 1 | 500 / 500 | 496.77 | 65.47 | 32.58 ms | 5,363 ms | 5,368 ms | 4 ms |
+| 2 | 500 / 500 | 403.80 | 65.33 | 56.71 ms | 5,106 ms | 5,120 ms | 6 ms |
+| 3 | 500 / 500 | 711.64 | 71.99 | 31.45 ms | 5,036 ms | 5,050 ms | 3 ms |
+
+**Test conditions:** local Docker on Apple M2, macOS arm64, 8 logical CPUs, 8 GiB host RAM; Docker reported 8 CPUs and approximately 3.83 GiB RAM. The load generator ran Node v24.19.0. Each round used 10 concurrent HTTP clients, worker concurrency 5, the reference handler, and payloads with 256 bytes of padding. API/project limits were raised to 100,000/minute only in the isolated benchmark. Request logging remained enabled. The run began at 00:52:49 IST on 7 September (19:22:49 UTC on 6 September).
+
+The report records base commit `1783a928a091b2635fd480e8c6269e0a5c52aef5` **with uncommitted changes**; use its source/config SHA-256 and container image identifiers as additional provenance, not the base commit alone.
+
+**Correctness verified by this run:** twenty simultaneous duplicate submissions produced one event; conflicting content returned 409; five transient failures succeeded on attempt two; five permanent failures exhausted three attempts and completed archival; manual retry preserved cumulative attempts; two keys shared a project quota (202, 202, 429); missing API-key authentication returned 401; and another account could not inspect the project (404). This is separate from the integration suite, whose execution output is not included in this report.
+
+**Interpretation:** the API acknowledged these bursts at 403.80–711.64 accepted requests/s; observed completions were 65.33–71.99/s. HTTP p95 was 31.45–56.71 ms, while intake-to-success p95 was 5.04–5.36 seconds. Do not describe the intake rate as completed-job throughput or the HTTP latency as end-to-end latency. Queue wait and dispatch pacing matter: the dispatcher reads up to 100 pending events per cycle and schedules its next cycle after a 1-second delay plus dispatch work. This is a plausible contributor to the observed gap, not a profiled root cause.
+
+**Limits:** these are short, warmed-up, closed-loop local bursts, not sustained cloud capacity tests. Observed completion rates include drain polling. Production rate limits differ, the handler performs little domain work, and no real webhook delivery, AI, uptime, crash recovery, or maximum capacity was measured. Zero unexpected errors in 1,500 events does not establish a long-term reliability guarantee.
+
+### Viewing benchmark metrics
+
+The dashboard's Overview shows per-project 24-hour counts, mean processing time, mean end-to-end latency, failure/retry rates, and state counts. It does **not** currently show requests/second or p50/p95/p99 distributions, and it cannot import a benchmark report. The exact burst metrics above are available in the retained report, not as dashboard cards.
+
+The benchmark uses a separate local database and randomly generated account credentials that are deliberately not saved. Its records do not appear in the hosted Vercel account, and an existing application login will not reveal those project records. Do not copy fixtures into production merely to populate the dashboard.
+
+To view **new manual test events** in a local dashboard against the benchmark API, keep the isolated stack running, stop any other Vite process on port 5173, and run:
+
+```sh
+API_PROXY_TARGET=http://127.0.0.1:3011 npm run dev:web
+```
+
+Leave `VITE_API_URL` unset. Open `http://localhost:5173` (the configured allowed origin), create a new local account/project/key, and send events. The overview polls every 10 seconds. This displays that new project's events, **not the original benchmark run**. Keep the exact burst percentiles in the report until a dedicated Benchmark Results view is implemented.
 
 ## Run locally
 
@@ -387,6 +429,7 @@ Every response is labeled **“Suggestion—not root cause.”** Missing configu
 | `PORT` | API | HTTP listener; default 3001; Render supplies its port |
 | `NODE_ENV` | Application | Set `production` for hosted secure cookies |
 | `PROJECT_RATE_LIMIT` | API | Shared project ingestion limit; default 100/minute |
+| `REQUEST_RATE_LIMIT` | API | General request limit; default 120/minute; benchmark stack explicitly raises it |
 | `RETRY_DELAY_MS` | Worker | Initial exponential backoff delay; default 1000 |
 | `WORKER_CONCURRENCY` | Worker | Event concurrency; default 5; webhook concurrency is separately fixed at 5 |
 | `QUEUE_PREFIX` | API + worker | Queue/rate-limit namespace; default `eventforge`; must match |
@@ -492,7 +535,7 @@ npm test
 npm run build
 ```
 
-The latest maintainer-provided local run during deployment reported **22 unit tests passed**, **9 integration tests skipped**, successful TypeScript checks, and a successful production build. This is not a claim that integration tests passed.
+The benchmark-tooling verification on 7 September 2026 recorded **28 unit tests passed**, **9 integration tests skipped**, successful TypeScript checks, and a successful production build. The six additional unit tests cover percentile calculations, missing/invalid measurements, workload bounds, and bounded concurrency. This is not a claim that integration tests or an end-to-end load test passed.
 
 Run the integration suite against disposable local services:
 
@@ -562,7 +605,7 @@ Implemented foundations are intentionally distinguished from future work:
 - Automate reconciliation after Redis data loss and define retention policies.
 - Add team membership/RBAC and optional per-key quotas.
 - Add worker heartbeats, alerting, tracing, and latency percentiles.
-- Run documented load tests before publishing capacity or reliability claims.
+- Extend the recorded local burst test with sustained arrival-rate workloads and deployed-environment measurements before making capacity or reliability claims.
 - Test backup restoration and always-on infrastructure failure scenarios.
 - Record the 3–5 minute walkthrough using [the demo script](outputs/DEMO.md); no finished video is included.
 - Complete a security review and remove/rotate any historically exposed credentials.

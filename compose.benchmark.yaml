@@ -1,0 +1,61 @@
+# Standalone, disposable stack. Never combine with the application compose file.
+name: eventforge-benchmark
+services:
+  mongo:
+    image: mongo:7
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  api:
+    build: .
+    ports: ["127.0.0.1:3011:3001"]
+    environment: &benchmark-env
+      MONGODB_URI: mongodb://mongo:27017/eventforge_benchmark
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: isolated-benchmark-only-not-a-production-secret
+      NODE_ENV: development
+      WEB_ORIGIN: http://localhost:5173
+      QUEUE_PREFIX: eventforge-benchmark
+      REQUEST_RATE_LIMIT: 100000
+      PROJECT_RATE_LIMIT: 100000
+      WORKER_CONCURRENCY: 5
+      RETRY_DELAY_MS: 1000
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  rate-api:
+    build: .
+    ports: ["127.0.0.1:3012:3001"]
+    environment:
+      <<: *benchmark-env
+      PROJECT_RATE_LIMIT: 2
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  worker:
+    build: .
+    command: ["npm", "run", "start:worker"]
+    environment: *benchmark-env
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  integration:
+    profiles: ["verification"]
+    build: .
+    command: ["npm", "run", "test:integration"]
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/eventforge_test
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_healthy }
